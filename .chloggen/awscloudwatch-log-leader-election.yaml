@@ -1,0 +1,4 @@
+change_type: enhancement
+component: receiver/aws_cloudwatch
+note: Support Kubernetes leader election for CloudWatch log collection.
+issues: []

@@ -38,6 +38,11 @@ $defs:
       initial_lookback:
         type: string
         format: duration
+      k8s_leader_elector:
+        description: K8sLeaderElector references the extension used to elect a single logs collector.
+        x-pointer: true
+        type: string
+        x-customType: go.opentelemetry.io/collector/component.ID
       max_events_per_request:
         type: integer
       poll_interval:

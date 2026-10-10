@@ -340,6 +340,23 @@ func TestLoadLogsConfig(t *testing.T) {
 	}
 }
 
+func TestLoadLogsLeaderElectionConfig(t *testing.T) {
+	for _, id := range []string{"k8s_leader_elector", "k8s_leader_elector/cloudwatch"} {
+		t.Run(id, func(t *testing.T) {
+			cfg := createDefaultConfig().(*Config)
+			cm := confmap.NewFromStringMap(map[string]any{
+				"region": "us-west-1",
+				"logs": map[string]any{
+					"k8s_leader_elector": id,
+				},
+			})
+			require.NoError(t, cm.Unmarshal(cfg))
+			require.NoError(t, confmap.Validate(cfg))
+			require.Equal(t, id, cfg.Logs.K8sLeaderElector.String())
+		})
+	}
+}
+
 func TestLoadMetricsConfig(t *testing.T) {
 	cm, err := confmaptest.LoadConf(filepath.Join("testdata", "config.yaml"))
 	require.NoError(t, err)

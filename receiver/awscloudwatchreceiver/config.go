@@ -83,6 +83,8 @@ type MetricQuery struct {
 
 // LogsConfig is the configuration for the logs portion of this receiver
 type LogsConfig struct {
+	// K8sLeaderElector references the extension used to elect a single logs collector.
+	K8sLeaderElector    *component.ID `mapstructure:"k8s_leader_elector"`
 	StartFrom           string        `mapstructure:"start_from"`
 	InitialLookback     time.Duration `mapstructure:"initial_lookback"`
 	PollInterval        time.Duration `mapstructure:"poll_interval"`

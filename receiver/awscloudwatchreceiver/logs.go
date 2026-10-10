@@ -17,11 +17,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/extension/xextension/storage"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/receiver"
 	"go.uber.org/zap"
 
+	"github.com/open-telemetry/opentelemetry-collector-contrib/extension/k8sleaderelector"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/adapter"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/receiver/awscloudwatchreceiver/internal/metadata"
 )
@@ -45,7 +47,10 @@ type logsReceiver struct {
 	client                        client
 	consumer                      consumer.Logs
 	wg                            *sync.WaitGroup
-	doneChan                      chan bool
+	leaderElectorID               *component.ID
+	pollMu                        sync.Mutex
+	pollCancel                    context.CancelFunc
+	shutdown                      bool
 	storageID                     *component.ID
 	cloudwatchCheckpointPersister *cloudwatchCheckpointPersister
 	accountID                     string
@@ -158,12 +163,70 @@ func newLogsReceiver(cfg *Config, settings receiver.Settings, consumer consumer.
 		groupNextStartTimes: map[string]time.Time{},
 		groupRequests:       groups,
 		wg:                  &sync.WaitGroup{},
-		doneChan:            make(chan bool),
+		leaderElectorID:     cfg.Logs.K8sLeaderElector,
 		storageID:           cfg.StorageID,
 	}
 }
 
 func (l *logsReceiver) Start(ctx context.Context, host component.Host) error {
+	if l.leaderElectorID == nil {
+		return l.start(ctx, host)
+	}
+
+	ext := host.GetExtensions()[*l.leaderElectorID]
+	if ext == nil {
+		return fmt.Errorf("unknown k8s leader elector %q", l.leaderElectorID)
+	}
+	elector, ok := ext.(k8sleaderelector.LeaderElection)
+	if !ok {
+		return fmt.Errorf("the extension %T does not implement k8sleaderelector.LeaderElection", ext)
+	}
+
+	// The storage client is only opened once this instance becomes the leader, so
+	// check the reference now to surface misconfiguration on standby instances too.
+	if err := validateStorageExtension(host, l.storageID); err != nil {
+		return err
+	}
+
+	elector.SetCallBackFuncs(
+		func(ctx context.Context) {
+			if err := l.start(ctx, host); err != nil {
+				l.settings.Logger.Error("failed to start log collection as leader", zap.Error(err))
+			}
+		},
+		func() {
+			if err := l.stop(context.Background()); err != nil {
+				l.settings.Logger.Error("failed to stop log collection after losing leadership", zap.Error(err))
+			}
+		},
+	)
+	return nil
+}
+
+// validateStorageExtension checks that storageID refers to a storage extension
+// without opening a client.
+func validateStorageExtension(host component.Host, storageID *component.ID) error {
+	if storageID == nil {
+		return nil
+	}
+	ext, ok := host.GetExtensions()[*storageID]
+	if !ok {
+		return fmt.Errorf("storage extension '%s' not found", storageID)
+	}
+	if _, ok := ext.(storage.Extension); !ok {
+		return fmt.Errorf("non-storage extension '%s' found", storageID)
+	}
+	return nil
+}
+
+func (l *logsReceiver) start(ctx context.Context, host component.Host) error {
+	l.pollMu.Lock()
+	defer l.pollMu.Unlock()
+
+	if l.shutdown || l.pollCancel != nil || ctx.Err() != nil {
+		return nil
+	}
+
 	if l.cloudwatchCheckpointPersister == nil {
 		storageClient, err := adapter.GetStorageClient(ctx, host, l.storageID, l.settings.ID)
 		if err != nil {
@@ -174,18 +237,35 @@ func (l *logsReceiver) Start(ctx context.Context, host component.Host) error {
 	}
 
 	l.settings.Logger.Debug("starting to poll for Cloudwatch logs")
+	pollCtx, cancel := context.WithCancel(ctx)
+	l.pollCancel = cancel
 	l.wg.Add(1)
-	go l.startPolling(ctx)
+	go l.startPolling(pollCtx)
 	return nil
 }
 
 func (l *logsReceiver) Shutdown(ctx context.Context) error {
 	l.settings.Logger.Debug("shutting down logs receiver")
-	close(l.doneChan)
-	l.wg.Wait()
+	l.pollMu.Lock()
+	l.shutdown = true
+	l.pollMu.Unlock()
+	return l.stop(ctx)
+}
+
+func (l *logsReceiver) stop(ctx context.Context) error {
+	l.pollMu.Lock()
+	defer l.pollMu.Unlock()
+
+	if l.pollCancel != nil {
+		l.pollCancel()
+		l.wg.Wait()
+		l.pollCancel = nil
+	}
 
 	if l.cloudwatchCheckpointPersister != nil {
-		if err := l.cloudwatchCheckpointPersister.Shutdown(ctx); err != nil {
+		err := l.cloudwatchCheckpointPersister.Shutdown(ctx)
+		l.cloudwatchCheckpointPersister = nil
+		if err != nil {
 			l.settings.Logger.Error("failed to close storage client", zap.Error(err))
 			return err
 		}
@@ -198,11 +278,10 @@ func (l *logsReceiver) startPolling(ctx context.Context) {
 	defer l.wg.Done()
 
 	t := time.NewTicker(l.pollInterval)
+	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-l.doneChan:
 			return
 		case <-t.C:
 			if l.autodiscover != nil {
@@ -265,6 +344,10 @@ func (l *logsReceiver) poll(ctx context.Context) error {
 		if err != nil {
 			errs = errors.Join(errs, err)
 		}
+		// Do not checkpoint a group whose poll was cut short by cancellation
+		if err := ctx.Err(); err != nil {
+			return errors.Join(errs, err)
+		}
 
 		// Persist the new end time as the checkpoint for this log group
 		if l.cloudwatchCheckpointPersister != nil {
@@ -297,7 +380,7 @@ func (l *logsReceiver) pollForLogs(ctx context.Context, pc groupRequest, startTi
 	// In case of failure, the startTime of the request will be used as the checkpoint for the next poll
 	nextStartTime := startTime
 
-	err := l.ensureSession()
+	err := l.ensureSession(ctx)
 	if err != nil {
 		return nextStartTime, err
 	}
@@ -306,10 +389,8 @@ func (l *logsReceiver) pollForLogs(ctx context.Context, pc groupRequest, startTi
 
 	for nextToken != nil {
 		select {
-		case _, ok := <-l.doneChan:
-			if !ok {
-				return nextStartTime, nil
-			}
+		case <-ctx.Done():
+			return nextStartTime, ctx.Err()
 		default:
 			input := pc.request(l.maxEventsPerRequest, *nextToken, &startTime, &endTime)
 			resp, err := l.client.FilterLogEvents(ctx, input)
@@ -416,7 +497,7 @@ func (l *logsReceiver) processEvents(now pcommon.Timestamp, logGroupName string,
 func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverConfig) ([]groupRequest, error) {
 	l.settings.Logger.Debug("attempting to discover log groups.", zap.Int("limit", auto.Limit))
 	groups := []groupRequest{}
-	err := l.ensureSession()
+	err := l.ensureSession(ctx)
 	if err != nil {
 		return groups, fmt.Errorf("unable to establish a session to auto discover log groups: %w", err)
 	}
@@ -487,7 +568,10 @@ func (l *logsReceiver) discoverGroups(ctx context.Context, auto *AutodiscoverCon
 	return groups, nil
 }
 
-func (l *logsReceiver) ensureSession() error {
+func (l *logsReceiver) ensureSession(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if l.client != nil {
 		return nil
 	}
@@ -504,14 +588,17 @@ func (l *logsReceiver) ensureSession() error {
 		cfgOptions = append(cfgOptions, config.WithSharedConfigProfile(l.profile))
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.Background(), cfgOptions...)
+	cfg, err := config.LoadDefaultConfig(ctx, cfgOptions...)
+	if err != nil {
+		return err
+	}
 	l.client = cloudwatchlogs.NewFromConfig(cfg)
 
 	stsClient := sts.NewFromConfig(cfg)
-	stsResult, _ := stsClient.GetCallerIdentity(context.Background(), &sts.GetCallerIdentityInput{})
-	if stsClient != nil && *stsResult.Account != "" {
+	stsResult, _ := stsClient.GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if stsResult != nil && stsResult.Account != nil {
 		l.accountID = *stsResult.Account
 	}
 
-	return err
+	return nil
 }

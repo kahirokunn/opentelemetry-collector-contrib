@@ -45,6 +45,43 @@ The receiver makes requests to the `sts.GetCallerIdentity` API endpoint, which i
 | `poll_interval`          | Duration | 1 minute                                   | Time to wait between log requests                                                                      |
 | `max_events_per_request` | Integer  | 1,000                                      | The maximum number of events to process per request to Cloudwatch                                      |
 | `groups`                 | Optional | All Log Groups and Streams                 | Configuration for Log Groups, by default all Log Groups and Log Streams will be collected.             |
+| `k8s_leader_elector`     | String   | —                                          | ID of a `k8s_leader_elector` extension. Only the elected leader collects logs.                         |
+
+### Log collection with multiple replicas
+
+Set `logs.k8s_leader_elector` to a [Kubernetes leader elector extension](../../extension/k8sleaderelector/README.md)
+to run multiple Collector replicas with the same log collection configuration. Only the leader
+polls CloudWatch; the other replicas wait. When leadership is lost, the receiver cancels polling
+and closes its storage client. It can resume collection if it becomes leader again.
+
+```yaml
+extensions:
+  k8s_leader_elector/cloudwatch:
+    auth_type: serviceAccount
+    lease_name: cloudwatch-logs
+    lease_namespace: observability
+
+receivers:
+  aws_cloudwatch/rds:
+    region: ap-northeast-1
+    logs:
+      k8s_leader_elector: k8s_leader_elector/cloudwatch
+      groups:
+        named:
+          /aws/rds/cluster/shared-prod-db-cluster/postgresql: {}
+
+service:
+  extensions: [k8s_leader_elector/cloudwatch]
+```
+
+Use the same lease and receiver ID on every replica. Leader election selects one collector for
+the entire logs configuration; it does not distribute log groups between replicas or coordinate
+metrics collection.
+
+Leader election does not replicate checkpoints. To resume from the previous leader's position,
+the replicas need access to the same checkpoints through the configured storage extension.
+Separate local storage can cause logs to be read again after a leader change. This configuration
+does not guarantee exactly-once delivery during failover.
 
 ### Group Parameters
 
